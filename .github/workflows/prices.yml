@@ -1,0 +1,106 @@
+name: Family Menu Prices
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish site to GitHub Pages (enable only after Pages setup)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 4 * * *'
+  push:
+    branches: [main]
+    paths: ['index.html']
+permissions:
+  contents: read
+concurrency:
+  group: family-menu-prices
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and validate price catalogs
+        shell: bash
+        run: |
+          mkdir -p _site
+          git archive HEAD | tar -x -C _site
+          rm -rf _site/.github _site/prices
+          python3 - <<'PY'
+          import json, pathlib, urllib.request, time, math, datetime
+          base = 'https://family-menu-prices.semenovdmi05.workers.dev/'
+          cities = {'moscow':'Москва', 'serpuhov':'Серпухов'}
+          stores = ['pyaterochka','magnit','perekrestok','lenta']
+          today = (datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=3)).date()
+          def validate(d, city, store):
+              assert d.get('success') is True and d.get('city') == cities[city]
+              assert d.get('storeKey') == store and d.get('priceType') == 'city_catalog_promotion'
+              assert d.get('version') == ('4.0-catalog' if store=='pyaterochka' else '4.1-catalog')
+              p=d['products']; assert isinstance(p,list) and 0<len(p)<=3000 and len(p)==d['totalProducts']
+              start=datetime.date.fromisoformat(d['period']['from']); end=datetime.date.fromisoformat(d['period']['to'])
+              assert start <= today <= end, 'catalog not active'
+              datetime.datetime.fromisoformat(d['checkedAt'].replace('Z','+00:00'))
+              for x in p:
+                  assert isinstance(x['name'],str) and x['currency']=='RUB'
+                  v=x['promoPrice']; assert isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v) and 0<v<=100000
+              return d
+          def get(url):
+              req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'FamilyMenuCatalog/1.0'})
+              with urllib.request.urlopen(req,timeout=35) as r:
+                  return json.loads(r.read(5_000_000))
+          report=[]
+          for city in cities:
+              for store in stores:
+                  path=pathlib.Path('_site/prices')/city/(store+'.json')
+                  for attempt in range(2):
+                      try:
+                          d=validate(get(base+'?city='+city+'&store='+store+'&all=1'),city,store)
+                          path.parent.mkdir(parents=True,exist_ok=True)
+                          path.write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+                          report.append(f'{city}/{store}: OK, {len(d["products"])} offers')
+                          break
+                      except Exception as e:
+                          print(f'{city}/{store} attempt {attempt+1}: {type(e).__name__}: {e}',flush=True)
+                          if attempt==0: time.sleep(2)
+                  else:
+                      # Preserve a previously published, still-active snapshot if available.
+                      try:
+                          d=validate(get('https://d1xerrus.github.io/family-menu/prices/'+city+'/'+store+'.json'),city,store)
+                          path.parent.mkdir(parents=True,exist_ok=True)
+                          path.write_text(json.dumps(d,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
+                          report.append(f'{city}/{store}: previous active snapshot, {len(d["products"])} offers')
+                      except Exception:
+                          report.append(f'{city}/{store}: FAILED, no valid snapshot')
+          print('\n'.join(report),flush=True)
+          pathlib.Path('_site/prices').mkdir(exist_ok=True)
+          pathlib.Path('_site/prices/report.txt').write_text('\n'.join(report),encoding='utf-8')
+          if not list(pathlib.Path('_site/prices').glob('*/*.json')):
+              raise SystemExit('No valid catalogs; publication stopped')
+          PY
+      - name: Upload price test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: price-catalogs
+          path: _site/prices
+      - name: Upload site for publishing
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+  deploy:
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish site
+        id: deployment
+        uses: actions/deploy-pages@v4
