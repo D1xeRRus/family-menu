@@ -1,0 +1,448 @@
+
+name: Lenta basket check
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Collect Lenta basket candidates
+        run: |
+          python3 - <<'PY'
+          import json, os, re, time, urllib.request
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          URL = 'https://mcp.lenta.com/mcp'
+          version, session, seq = '2025-03-26', None, 0
+
+          def rpc(method, params, notification=False):
+              global session, seq
+              seq += 1
+              msg = dict(jsonrpc='2.0', method=method, params=params)
+
+              if not notification:
+                  msg['id'] = seq
+
+              headers = {
+                  'Content-Type':'application/json',
+                  'Accept':'application/json, text/event-stream',
+                  'MCP-Protocol-Version':version
+              }
+
+              if session:
+                  headers['Mcp-Session-Id'] = session
+
+              req = urllib.request.Request(
+                  URL,
+                  json.dumps(msg).encode(),
+                  headers
+              )
+
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  session = r.headers.get(
+                      'Mcp-Session-Id'
+                  ) or session
+
+                  if notification:
+                      return None
+
+                  if 'text/event-stream' in r.headers.get(
+                      'Content-Type',''
+                  ):
+                      for line in r:
+                          if line.startswith(b'data:'):
+                              obj = json.loads(line[5:])
+                              if obj.get('id') == seq:
+                                  break
+                      else:
+                          raise RuntimeError(
+                              'No matching SSE response'
+                          )
+                  else:
+                      obj = json.load(r)
+
+              if 'error' in obj:
+                  raise RuntimeError(str(obj['error']))
+
+              return obj['result']
+
+          def unwrap(result):
+              if result.get('isError'):
+                  raise RuntimeError(str(result)[:400])
+
+              for block in result.get('content',[]):
+                  if block.get('type') == 'text':
+                      try:
+                          x = json.loads(block['text'])
+                      except (ValueError, TypeError):
+                          continue
+
+                      if x.get('ok') is True:
+                          return x['data']
+
+                      if x.get('ok') is False:
+                          raise RuntimeError(str(x)[:400])
+
+              raise RuntimeError(
+                  'Unknown MCP result format'
+              )
+
+          def call(name, args):
+              return unwrap(rpc(
+                  'tools/call',
+                  {'name':name,'arguments':args}
+              ))
+
+          def n(s):
+              return re.sub(
+                  r'[^а-яa-z0-9]', '',
+                  str(s).lower().replace('ё','е')
+              )
+
+          STORES = [
+              (
+                  'moscow',
+                  'Москва, улица Поречная, дом 10',
+                  'поречная',
+                  r'10(?!\d)',
+                  344
+              ),
+              (
+                  'serpuhov',
+                  'Московская область, Серпухов, деревня Борисово, дом 111А',
+                  'борисово',
+                  r'111[аa](?!\d)',
+                  None
+              )
+          ]
+
+          QUERIES = [
+              ('potato','Картофель красный весовой',181019),
+              ('chicken','Филе куриное Петелинка',123265),
+              ('milk','Молоко ЭкоНива 2,5%',673140),
+              ('buck','Гречневая крупа',None),
+              ('egg','Яйца куриные',None),
+              ('cucumber','Огурцы свежие',None),
+              ('carrot','Морковь свежая',None),
+              ('lentil','Чечевица крупа',None),
+              ('tomato','Помидоры свежие',None),
+              ('onion','Лук репчатый',None),
+              ('rice','Рис крупа',None),
+              ('pollock','Минтай филе замороженное',None),
+              ('broccoli','Брокколи замороженная',None),
+              ('oats','Овсяные хлопья',None),
+              ('banana','Бананы',None),
+              ('turkey','Филе индейки охлажденное',None),
+              ('cabbage','Капуста белокочанная',None)
+          ]
+
+          CONTROL = {
+              181019:(69.99,73.69),
+              123265:(579.99,610.59),
+              673140:(109.99,134.79)
+          }
+
+          def select_store(data, street, number, expected):
+              matches = [
+                  h for h in data.get('hubs',[])
+                  if street in n(h.get('address',''))
+                  and re.search(
+                      number,n(h.get('address',''))
+                  )
+                  and h.get('format') == 'hyper'
+              ]
+
+              ids = {
+                  int(h['aliasId'])
+                  for h in matches
+                  if h.get('aliasId') is not None
+              }
+
+              if len(ids) != 1:
+                  raise RuntimeError(
+                      'Exact hypermarket not resolved: '
+                      +str(matches)[:500]
+                  )
+
+              sid = ids.pop()
+
+              if expected is not None and sid != expected:
+                  raise RuntimeError(
+                      'Unexpected store alias'
+                  )
+
+              return sid
+
+          def main():
+              global version
+
+              init = rpc(
+                  'initialize',
+                  {
+                      'protocolVersion':version,
+                      'capabilities':{},
+                      'clientInfo':{
+                          'name':'family-menu-basket',
+                          'version':'1.0'
+                      }
+                  }
+              )
+
+              version = init['protocolVersion']
+
+              rpc(
+                  'notifications/initialized',
+                  {},
+                  True
+              )
+
+              tools = {
+                  t['name']
+                  for t in rpc(
+                      'tools/list',{}
+                  )['tools']
+              }
+
+              if not {
+                  'storefront_resolve_store',
+                  'storefront_products_search'
+              } <= tools:
+                  raise RuntimeError(
+                      'Required MCP tools unavailable'
+                  )
+
+              report = [
+                  '# Лента: проверка корзины',
+                  'Канал locc (самовывоз), только диагностические данные; не цены торгового зала.',
+                  ''
+              ]
+
+              out = {
+                  'source':URL,
+                  'channel':'locc',
+                  'retailConfirmed':False,
+                  'checkedAt':datetime.now(
+                      timezone.utc
+                  ).isoformat(),
+                  'stores':{}
+              }
+
+              for city,address,street,number,expected in STORES:
+
+                  rec = {
+                      'address':address,
+                      'queries':{}
+                  }
+
+                  out['stores'][city] = rec
+
+                  report += [
+                      '## '+address,
+                      '',
+                      '| Запрос | Найдено | Пример / контроль |',
+                      '|---|---:|---|'
+                  ]
+
+                  try:
+                      resolved = call(
+                          'storefront_resolve_store',
+                          {
+                              'address':address,
+                              'retailBrand':'lo',
+                              'channel':'locc'
+                          }
+                      )
+
+                      sid = select_store(
+                          resolved,
+                          street,
+                          number,
+                          expected
+                      )
+
+                      rec['storeId'] = sid
+
+                  except Exception as e:
+                      rec['error'] = str(e)
+
+                      report += [
+                          '| Магазин | 0 | Ошибка определения |',
+                          ''
+                      ]
+
+                      print(city,str(e),flush=True)
+                      continue
+
+                  print(
+                      city,'storeId',sid,
+                      flush=True
+                  )
+
+                  for key,query,sku in QUERIES:
+
+                      try:
+                          data = call(
+                              'storefront_products_search',
+                              {
+                                  'storeId':sid,
+                                  'retailBrand':'lo',
+                                  'channel':'locc',
+                                  'query':query,
+                                  'page':1
+                              }
+                          )
+
+                          if (
+                              str(data.get('storeId')) != str(sid)
+                              or data.get('channel') != 'locc'
+                          ):
+                              raise RuntimeError(
+                                  'Wrong store or channel in response'
+                              )
+
+                          items = data.get('items')
+
+                          if not isinstance(items,list):
+                              raise RuntimeError(
+                                  'Missing items array'
+                              )
+
+                          rec['queries'][key] = {
+                              'query':query,
+                              'items':items
+                          }
+
+                          if sku:
+                              sample = next(
+                                  (
+                                      x for x in items
+                                      if str(x.get('id')) == str(sku)
+                                  ),
+                                  None
+                              )
+                          else:
+                              sample = (
+                                  items[0]
+                                  if items
+                                  else None
+                              )
+
+                          if sample:
+                              label = (
+                                  f"{sample.get('name')} — "
+                                  f"{sample.get('price')} / "
+                                  f"{sample.get('priceRegular')} ₽; "
+                                  f"упаковка: "
+                                  f"{sample.get('package') or 'не указана'}"
+                              )
+
+                              if sku and city == 'moscow':
+                                  same = (
+                                      sample.get('price'),
+                                      sample.get('priceRegular')
+                                  ) == CONTROL[sku]
+
+                                  label += '; ' + (
+                                      'цены совпали'
+                                      if same
+                                      else 'цены отличаются'
+                                  )
+
+                          elif sku:
+                              label = (
+                                  'Контрольный артикул не найден '
+                                  'на первой странице'
+                              )
+                          else:
+                              label = 'Нет результатов'
+
+                          safe_label = label.replace(
+                              '|','/'
+                          ).replace(chr(10),' ')
+
+                          report.append(
+                              f"| {query} | {len(items)} | "
+                              f"{safe_label} |"
+                          )
+
+                          print(
+                              city,key,len(items),label,
+                              flush=True
+                          )
+
+                      except Exception as e:
+                          rec['queries'][key] = {
+                              'query':query,
+                              'error':str(e)
+                          }
+
+                          report.append(
+                              f'| {query} | — | Ошибка запроса |'
+                          )
+
+                          print(
+                              city,key,'ERROR',str(e),
+                              flush=True
+                          )
+
+                      time.sleep(.4)
+
+                  report += ['']
+
+              Path('lenta-results').mkdir(
+                  exist_ok=True
+              )
+
+              Path(
+                  'lenta-results/catalog.json'
+              ).write_text(
+                  json.dumps(
+                      out,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding='utf-8'
+              )
+
+              text = '\n'.join(report)+'\n'
+
+              Path(
+                  'lenta-results/report.md'
+              ).write_text(
+                  text,
+                  encoding='utf-8'
+              )
+
+              with open(
+                  os.environ['GITHUB_STEP_SUMMARY'],
+                  'a',
+                  encoding='utf-8'
+              ) as f:
+                  f.write(text)
+
+              if not any(
+                  'items' in q
+                  for s in out['stores'].values()
+                  for q in s.get('queries',{}).values()
+              ):
+                  raise RuntimeError(
+                      'No valid catalog responses'
+                  )
+
+          if __name__=='__main__':
+              main()
+          PY
+
+      - name: Save catalog and short report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lenta-basket-results
+          path: lenta-results/
+          if-no-files-found: warn
