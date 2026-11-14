@@ -1,0 +1,243 @@
+
+name: Lenta API check
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check official Lenta sources
+        run: |
+          python3 - <<'PY'
+          import json
+          import urllib.request
+          import urllib.parse
+          import re
+
+          def get(url):
+              with urllib.request.urlopen(url, timeout=20) as r:
+                  return json.load(r)
+
+          def objects(x):
+              if isinstance(x, dict):
+                  yield x
+                  for v in x.values():
+                      yield from objects(v)
+              elif isinstance(x, list):
+                  for v in x:
+                      yield from objects(v)
+
+          def norm(x):
+              return re.sub(
+                  r'[^а-я0-9]', '',
+                  str(x).lower().replace('ё','е')
+              )
+
+          base = 'https://integration.api.lenta.com'
+
+          print('=== STORE LOOKUP ===', flush=True)
+
+          try:
+              stores = get(
+                  base + '/v1/stores?retailBrand=lo'
+              )
+
+              targets = [
+                  ('Moscow','поречная','10'),
+                  ('Serpuhov','борисово','111')
+              ]
+
+              for city, street, number in targets:
+                  candidates = []
+
+                  for s in objects(stores):
+                      sid = s.get(
+                          'id', s.get(
+                              'storeId', s.get('store_id')
+                          )
+                      )
+
+                      address = s.get(
+                          'address', s.get(
+                              'fullAddress', s.get('name','')
+                          )
+                      )
+
+                      text = norm(address)
+
+                      if (
+                          isinstance(sid, (str,int))
+                          and street in text
+                          and number in text
+                      ):
+                          candidates.append((sid,address))
+
+                  print(
+                      city,
+                      json.dumps(
+                          candidates[:8],
+                          ensure_ascii=False
+                      ),
+                      flush=True
+                  )
+
+                  if len(candidates) == 1:
+                      sid = candidates[0][0]
+
+                      for query in (
+                          'картофель',
+                          'молоко 2,5%'
+                      ):
+                          params = urllib.parse.urlencode({
+                              'stores': sid,
+                              'channel': 'cc',
+                              'retailBrand': 'lo',
+                              'query': query,
+                              'limit': 2,
+                              'offset': 0
+                          })
+
+                          try:
+                              result = get(
+                                  base +
+                                  '/catalog/v1/items?' +
+                                  params
+                              )
+
+                              print(
+                                  'PICKUP ONLY',
+                                  city, query,
+                                  json.dumps(
+                                      result,
+                                      ensure_ascii=False
+                                  )[:2400],
+                                  flush=True
+                              )
+
+                          except Exception as e:
+                              print(
+                                  'PICKUP ERROR',
+                                  city, query, str(e),
+                                  flush=True
+                              )
+
+          except Exception as e:
+              print('REST ERROR:', str(e), flush=True)
+
+          print('=== OFFICIAL MCP ===', flush=True)
+
+          endpoint = 'https://mcp.lenta.com/mcp'
+          session = None
+          version = '2025-03-26'
+
+          def rpc(method, params, rid=None):
+              global session
+
+              msg = {
+                  'jsonrpc': '2.0',
+                  'method': method,
+                  'params': params
+              }
+
+              if rid is not None:
+                  msg['id'] = rid
+
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Accept': 'application/json, text/event-stream',
+                  'MCP-Protocol-Version': version
+              }
+
+              if session:
+                  headers['Mcp-Session-Id'] = session
+
+              req = urllib.request.Request(
+                  endpoint,
+                  data=json.dumps(msg).encode(),
+                  headers=headers,
+                  method='POST'
+              )
+
+              with urllib.request.urlopen(
+                  req, timeout=20
+              ) as r:
+
+                  session = (
+                      r.headers.get('Mcp-Session-Id')
+                      or session
+                  )
+
+                  if rid is None:
+                      return {}
+
+                  if 'text/event-stream' in r.headers.get(
+                      'Content-Type',''
+                  ):
+                      for line in r:
+                          if line.startswith(b'data:'):
+                              value = json.loads(line[5:])
+
+                              if value.get('id') == rid:
+                                  return value
+
+                      raise ValueError(
+                          'No matching SSE response'
+                      )
+
+                  return json.load(r)
+
+          try:
+              init = rpc(
+                  'initialize',
+                  {
+                      'protocolVersion': version,
+                      'capabilities': {},
+                      'clientInfo': {
+                          'name': 'family-menu-check',
+                          'version': '1.0'
+                      }
+                  },
+                  1
+              )
+
+              if 'result' not in init:
+                  raise ValueError(str(init))
+
+              version = init['result'].get(
+                  'protocolVersion', version
+              )
+
+              print(
+                  'MCP connected:', version,
+                  flush=True
+              )
+
+              rpc('notifications/initialized', {}, None)
+
+              tools = rpc(
+                  'tools/list', {}, 2
+              )['result']['tools']
+
+              for t in tools:
+                  if t['name'] in (
+                      'storefront_resolve_store',
+                      'storefront_stores_list',
+                      'storefront_products_search'
+                  ):
+                      print(
+                          t['name'],
+                          json.dumps(
+                              t.get('inputSchema',{}),
+                              ensure_ascii=False
+                          ),
+                          flush=True
+                      )
+
+          except Exception as e:
+              print('MCP ERROR:', str(e), flush=True)
+          PY
